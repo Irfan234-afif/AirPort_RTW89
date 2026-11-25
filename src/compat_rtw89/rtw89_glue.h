@@ -367,6 +367,9 @@ struct rtw89_glue_link {
     uint32_t rx_replay;             /* frames with a packet number already used */
     uint32_t rx_dup;                /* retransmissions of frames already received */
     uint32_t rx_reorder_timeout;    /* frames passed on after waiting in vain for an earlier one */
+    uint32_t rx_tkip;               /* TKIP group frames decrypted in software */
+    uint32_t rx_tkip_icv;           /* ... whose ICV failed */
+    uint32_t rx_tkip_mic;           /* ... whose Michael failed (reported to the AP) */
 
     /* receive timing, by the chip's own timestamps */
     uint32_t rx_late;               /* frames handed over more than 5 ms after arriving */

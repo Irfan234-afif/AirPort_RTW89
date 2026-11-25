@@ -6,7 +6,9 @@
  * HMAC-SHA256, the 802.11 KDF and AES-CMAC. Plain C with no Linux or kernel types,
  * so the userspace smoke test can use the same code to play the authenticator.
  *
- * Frame encryption itself (CCMP) is done by the hardware.
+ * Frame encryption itself (CCMP) is done by the hardware; TKIP, which some
+ * chips cannot do, is decrypted here for the group frames of a WPA/WPA2 mixed
+ * network.
  */
 #ifndef _RTW89_CRYPTO_H
 #define _RTW89_CRYPTO_H
@@ -84,6 +86,49 @@ bool rtw89_ccmp_decrypt(const uint8_t tk[16], const uint8_t *hdr, size_t hdr_len
 
 /* Compare without leaking where the difference is. */
 bool rtw89_crypto_equal(const uint8_t *a, const uint8_t *b, size_t len);
+
+/*
+ * TKIP (IEEE 802.11 12.5.2) in software, for the group key of a WPA/WPA2
+ * mixed network, which rtw89 does not put in the chip where its
+ * hw_tkip_crypto is false (the RTL8852B among others): mac80211 then decrypts
+ * the AP's group frames itself, and so does rtw89_data.c. The pairwise
+ * cipher of such a network stays CCMP, in the hardware.
+ *
+ * @body: an MPDU's bytes after its 802.11 header: the 8-byte IV and Extended
+ * IV, the MSDU with its Michael MIC, and the 4-byte ICV. decrypt works in
+ * place and leaves the IV as it is; it returns false if @body is too short,
+ * has no Extended IV, or its ICV does not match (as
+ * ieee80211_tkip_decrypt_data()). The replay check, on rtw89_tkip_tsc(), and
+ * the Michael check are the caller's. encrypt is for the userspace smoke
+ * test's access point: it writes the IV and the ICV around the plaintext.
+ */
+#define RTW89_TKIP_IV_LEN 8
+#define RTW89_TKIP_ICV_LEN 4
+#define RTW89_MICHAEL_LEN 8
+uint64_t rtw89_tkip_tsc(const uint8_t iv[RTW89_TKIP_IV_LEN]);
+bool rtw89_tkip_decrypt(const uint8_t tk[16], const uint8_t ta[6], uint8_t *body, size_t len);
+void rtw89_tkip_encrypt(const uint8_t tk[16], const uint8_t ta[6], uint64_t tsc, uint8_t keyid,
+                        uint8_t *body, size_t len);
+/* The key mixing on its own, for the test vectors: phase 1 of the TSC's high
+ * 32 bits, phase 2 of its low 16 bits to the per-frame RC4 key. */
+void rtw89_tkip_phase1(const uint8_t tk[16], const uint8_t ta[6], uint32_t iv32, uint16_t p1k[5]);
+void rtw89_tkip_phase2(const uint8_t tk[16], const uint16_t p1k[5], uint16_t iv16,
+                       uint8_t rc4key[16]);
+void rtw89_rc4(const uint8_t *key, size_t key_len, uint8_t *data, size_t len);
+/* The IEEE 802.3 CRC-32, WEP's and TKIP's ICV. */
+uint32_t rtw89_crc32(const uint8_t *data, size_t len);
+
+/*
+ * Michael (12.5.2.3), TKIP's message integrity code: over an MSDU from @sa to
+ * @da at @priority (the TID of a QoS frame, else 0), the 8-byte key being the
+ * one its sender signs with. _raw is the bare function over @msg, for the
+ * standard's test vectors.
+ */
+void rtw89_michael(const uint8_t key[8], const uint8_t da[6], const uint8_t sa[6],
+                   uint8_t priority, const uint8_t *data, size_t len,
+                   uint8_t mic[RTW89_MICHAEL_LEN]);
+void rtw89_michael_raw(const uint8_t key[8], const uint8_t *msg, size_t len,
+                       uint8_t mic[RTW89_MICHAEL_LEN]);
 
 #ifdef __cplusplus
 }

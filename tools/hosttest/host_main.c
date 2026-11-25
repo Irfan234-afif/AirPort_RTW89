@@ -485,20 +485,30 @@ static int ap_check_sta_key(void)
 static uint16_t ap_key_ver = 2;
 static bool ap_igtk;
 static bool ap_rsnxe;           /* the station's message 2 must carry its RSNXE */
+static size_t ap_gtk_len = 16;  /* 32 for a TKIP group key */
+/* more elements for message 3's key data, after the RSN element: a WPA/WPA2
+ * mixed AP's WPA element, as hostapd keeps both in its wpa_ie */
+static const uint8_t *ap_msg3_extra;
+static size_t ap_msg3_extra_len;
 
 /* Message 3: our RSN element and the group key, encrypted with the KEK. */
-static void ap_send_msg3(const uint8_t gtk[16], int gtk_idx)
+static void ap_send_msg3(const uint8_t *gtk, int gtk_idx)
 {
     const uint8_t *rsn = ap_find_ie(0x30);          /* the RSN element of the beacon */
-    uint8_t kd[128];
+    uint8_t kd[160];
     size_t kd_len = 2 + rsn[1];
 
     memcpy(kd, rsn, kd_len);
+    if (ap_msg3_extra) {
+        memcpy(kd + kd_len, ap_msg3_extra, ap_msg3_extra_len);
+        kd_len += ap_msg3_extra_len;
+    }
     memcpy(kd + kd_len, "\xdd\x16\x00\x0f\xac\x01", 6);
+    kd[kd_len + 1] = (uint8_t)(6 + ap_gtk_len);
     kd[kd_len + 6] = (uint8_t)gtk_idx;
     kd[kd_len + 7] = 0;
-    memcpy(kd + kd_len + 8, gtk, 16);
-    kd_len += 24;
+    memcpy(kd + kd_len + 8, gtk, ap_gtk_len);
+    kd_len += 8 + ap_gtk_len;
     if (ap_igtk) {
         /* IGTK KDE: key id 4, IPN 0 */
         memcpy(kd + kd_len, "\xdd\x1c\x00\x0f\xac\x09\x04\x00\x00\x00\x00\x00\x00\x00", 14);
@@ -591,15 +601,16 @@ static int ap_handshake(const uint8_t gtk[16], int gtk_idx)
 }
 
 /* A new group key, sent encrypted under the pairwise key like any data. */
-static int ap_group_rekey(const uint8_t gtk[16], int gtk_idx)
+static int ap_group_rekey(const uint8_t *gtk, int gtk_idx)
 {
-    uint8_t kd[32];
+    uint8_t kd[48];
     int base = ap.eapol_count, info;
 
-    kd[0] = 0xdd; kd[1] = 22; kd[2] = 0x00; kd[3] = 0x0f; kd[4] = 0xac; kd[5] = 1;
+    kd[0] = 0xdd; kd[1] = (uint8_t)(6 + ap_gtk_len); kd[2] = 0x00; kd[3] = 0x0f; kd[4] = 0xac; kd[5] = 1;
     kd[6] = (uint8_t)gtk_idx; kd[7] = 0;
-    memcpy(kd + 8, gtk, 16);
-    ap_send_key(0x1380 | ap_key_ver, kd, 24, true);     /* ack, mic, secure, encrypted */
+    memcpy(kd + 8, gtk, ap_gtk_len);
+    /* 24 or 40 bytes: a multiple of 8, as the key wrap wants */
+    ap_send_key(0x1380 | ap_key_ver, kd, 8 + ap_gtk_len, true);     /* ack, mic, secure, encrypted */
 
     if (!ap_wait_eapol(base + 1))
         return -1;
@@ -1633,6 +1644,187 @@ static int join_sae(const char *password, bool want_token, bool h2e)
     return 0;
 }
 
+/*
+ * A group data frame from the AP under the TKIP group key @gtk (its 32 bytes)
+ * with id @keyid and TSC @tsc, as a chip without TKIP hands it up: not
+ * decrypted. Michael over the MSDU with the authenticator's half of the key,
+ * then the TKIP seal from transmitter @ta. @spoil: 1 damages the ciphertext
+ * (the ICV fails), 2 the Michael MIC under a valid ICV. @tid < 0: no QoS.
+ */
+static void ap_send_tkip(const uint8_t *ta, const uint8_t *sa, int tid, uint16_t seq, int keyid,
+                         uint64_t tsc, const uint8_t *gtk, int spoil,
+                         const uint8_t *body, size_t body_len)
+{
+    uint8_t frame[24 + 2 + 8 + 2048 + 8 + 4];
+    size_t hdr = tid >= 0 ? 26 : 24, len = 8 + body_len + 8 + 4;
+
+    if (body_len > 2048)
+        return;
+    memset(frame, 0, hdr);
+    frame[0] = tid >= 0 ? 0x88 : 0x08;
+    frame[1] = 0x02 | 0x40;                         /* from the DS, protected */
+    memcpy(frame + 4, bcast_mac, 6);
+    memcpy(frame + 10, ta, 6);
+    memcpy(frame + 16, sa, 6);
+    frame[22] = (uint8_t)(seq << 4);
+    frame[23] = (uint8_t)(seq >> 4);
+    if (tid >= 0)
+        frame[24] = (uint8_t)tid;
+    memcpy(frame + hdr + 8, body, body_len);
+    rtw89_michael(gtk + 16, bcast_mac, sa, tid >= 0 ? (uint8_t)tid : 0, body, body_len,
+                  frame + hdr + 8 + body_len);
+    if (spoil == 2)
+        frame[hdr + 8 + body_len] ^= 0x01;
+    rtw89_tkip_encrypt(gtk, ta, tsc, (uint8_t)keyid, frame + hdr, len);
+    if (spoil == 1)
+        frame[hdr + 8 + 3] ^= 0x10;
+    rtw89_glue_test_rx(frame, hdr + len, ap_freq, -40, false);
+}
+
+/*
+ * WPA/WPA2 mixed mode as an ISP router runs it, its RSN and WPA elements as
+ * Windows' WlanGetNetworkBssList gave them for the network this was written
+ * for: TKIP group, TKIP and CCMP pairwise, PSK, no capabilities. The station
+ * joins under CCMP, keeps the 32-byte TKIP group key in software and
+ * decrypts the AP's group frames itself (the RTL8852B's hw_tkip_crypto is
+ * false). Returns the number of failures.
+ */
+static uint8_t ap_ies_tkip[sizeof(ap_ies) + 4 + 28];
+
+static int test_tkip_group(void)
+{
+    static const uint8_t mixed_rsn[26] = {
+        0x30, 24, 1, 0, 0x00, 0x0f, 0xac, 2, 2, 0, 0x00, 0x0f, 0xac, 2, 0x00, 0x0f, 0xac, 4,
+        1, 0, 0x00, 0x0f, 0xac, 2, 0, 0,
+    };
+    static const uint8_t wpa_ie[28] = {
+        0xdd, 26, 0x00, 0x50, 0xf2, 1, 1, 0, 0x00, 0x50, 0xf2, 2, 2, 0, 0x00, 0x50, 0xf2, 2,
+        0x00, 0x50, 0xf2, 4, 1, 0, 0x00, 0x50, 0xf2, 2,
+    };
+    const size_t rsn = AP_RSN_AKM - 19;     /* where the RSN element starts */
+    const uint64_t saved_gtk_pn = ap.gtk_pn;
+    uint8_t gtk1[32], gtk2[32], body[8 + sizeof(test_ip)];
+    struct rtw89_glue_link link;
+    const uint8_t *ie;
+    int failures = 0, n, base, i;
+    uint64_t tsc;
+
+#define EXPECT(cond) do { if (!(cond)) { failures++; printf("== FAIL %s\n", #cond); } } while (0)
+    for (i = 0; i < 32; i++) {
+        gtk1[i] = (uint8_t)(0x50 + i);
+        gtk2[i] = (uint8_t)(0xa0 + i);
+    }
+    memcpy(body, "\xaa\xaa\x03\x00\x00\x00\x08\x00", 8);
+    memcpy(body + 8, test_ip, sizeof(test_ip));
+
+    /* the beacon: the router's RSN element, its WPA element after WMM's */
+    memcpy(ap_ies_tkip, ap_ies, rsn);
+    memcpy(ap_ies_tkip + rsn, mixed_rsn, sizeof(mixed_rsn));
+    memcpy(ap_ies_tkip + rsn + sizeof(mixed_rsn), ap_ies + rsn + 22, sizeof(ap_ies) - rsn - 22);
+    memcpy(ap_ies_tkip + sizeof(ap_ies) + 4, wpa_ie, sizeof(wpa_ie));
+    ap_select(false);
+    ap_cur_ies = ap_ies_tkip;
+    ap_cur_ies_len = sizeof(ap_ies_tkip);
+    ap_msg3_extra = wpa_ie;
+    ap_msg3_extra_len = sizeof(wpa_ie);
+    ap_gtk_len = 32;
+    ap.gtk_pn = 0xfffe;             /* the TSC's low 16 bits wrap with the frames below */
+    rtw89_glue_set_rejoin(false);
+    ap_send_beacon();
+
+    EXPECT(join_testnet(AP_PASSWORD, 0));
+    EXPECT(wait_link(RTW89_GLUE_LINK_ASSOCIATED));
+    /* RSN, the AP's TKIP group cipher, CCMP pairwise, PSK, no frame protection */
+    ie = sta_assoc_ie(48);
+    EXPECT(ie && ie[1] == 20 && !memcmp(ie + 4, "\x00\x0f\xac\x02", 4) &&
+           !memcmp(ie + 8, "\x01\x00\x00\x0f\xac\x04", 6) && ie[19] == 2 && ie[20] == 0);
+    /* 802.11n stays on: the pairwise cipher is CCMP */
+    EXPECT(sta_assoc_ie(45) != NULL);
+    EXPECT(ap_handshake(gtk1, 1) == 0);
+    EXPECT(wait_link(RTW89_GLUE_LINK_CONNECTED));
+    EXPECT(sta_tx_test() == 0);
+    printf("== connected to a WPA/WPA2 mixed network: CCMP pairwise, TKIP group\n");
+
+    /* group frames under the TKIP key, as the chip hands them up */
+    n = sta_rx.count;
+    tsc = ap.gtk_pn + 1;            /* 0xffff */
+    ap_send_tkip(ap_mac, peer_mac, -1, 201, 1, tsc, gtk1, 0, body, sizeof(body));
+    EXPECT(sta_rx.count == n + 1 && sta_rx.len == 14 + sizeof(test_ip));
+    EXPECT(!memcmp(sta_rx.frame, bcast_mac, 6) && !memcmp(sta_rx.frame + 6, peer_mac, 6) &&
+           sta_rx.frame[12] == 0x08 && sta_rx.frame[13] == 0x00 &&
+           !memcmp(sta_rx.frame + 14, test_ip, sizeof(test_ip)));
+    /* past the TSC's low 16 bits: phase 1 again */
+    ap_send_tkip(ap_mac, peer_mac, -1, 202, 1, tsc + 1, gtk1, 0, body, sizeof(body));
+    EXPECT(sta_rx.count == n + 2);
+    /* the same TSC again, and the AP's RSC itself: replays */
+    ap_send_tkip(ap_mac, peer_mac, -1, 203, 1, tsc + 1, gtk1, 0, body, sizeof(body));
+    ap_send_tkip(ap_mac, peer_mac, -1, 204, 1, ap.gtk_pn, gtk1, 0, body, sizeof(body));
+    EXPECT(sta_rx.count == n + 2);
+    /* QoS on TID 5: a counter of its own, and the TID in Michael */
+    ap_send_tkip(ap_mac, peer_mac, 5, 1, 1, tsc, gtk1, 0, body, sizeof(body));
+    EXPECT(sta_rx.count == n + 3);
+    /* dropped without a report: a damaged frame (its ICV fails), one from
+     * another transmitter, one under a key id that holds no key */
+    base = ap.eapol_count;
+    ap_send_tkip(ap_mac, peer_mac, -1, 205, 1, tsc + 2, gtk1, 1, body, sizeof(body));
+    ap_send_tkip(peer_mac, peer_mac, -1, 206, 1, tsc + 3, gtk1, 0, body, sizeof(body));
+    ap_send_tkip(ap_mac, peer_mac, -1, 207, 2, tsc + 4, gtk1, 0, body, sizeof(body));
+    usleep(200 * 1000);
+    EXPECT(sta_rx.count == n + 3 && ap.eapol_count == base);
+    /* the damaged frame's TSC did not count */
+    ap_send_tkip(ap_mac, peer_mac, -1, 208, 1, tsc + 2, gtk1, 0, body, sizeof(body));
+    EXPECT(sta_rx.count == n + 4);
+
+    /* Michael fails under a good ICV: dropped, and reported to the AP under
+     * the pairwise key, an EAPOL-Key request with Error (and Secure, MIC) */
+    base = ap.eapol_count;
+    ap_send_tkip(ap_mac, peer_mac, -1, 209, 1, tsc + 3, gtk1, 2, body, sizeof(body));
+    EXPECT(ap_wait_eapol(base + 1) && sta_rx.count == n + 4);
+    EXPECT(ap_check_sta_key() == (0x0f00 | 2) && ap.eapol_protected);
+    /* its TSC did not count either: the frame as sent gets through */
+    ap_send_tkip(ap_mac, peer_mac, -1, 210, 1, tsc + 3, gtk1, 0, body, sizeof(body));
+    EXPECT(sta_rx.count == n + 5);
+
+    /* a new group key, id 2, in a group handshake: 32 bytes as well */
+    ap.gtk_pn = 0x10;
+    EXPECT(ap_group_rekey(gtk2, 2) == 0);
+    ap_send_tkip(ap_mac, peer_mac, -1, 211, 2, 0x11, gtk2, 0, body, sizeof(body));
+    EXPECT(sta_rx.count == n + 6);
+    /* the same key again (the AP retried): not installed again, so its
+     * counter is not reset and the frame stays a replay (KRACK) */
+    EXPECT(ap_group_rekey(gtk2, 2) == 0);
+    ap_send_tkip(ap_mac, peer_mac, -1, 212, 2, 0x11, gtk2, 0, body, sizeof(body));
+    EXPECT(sta_rx.count == n + 6);
+    /* the old key still opens its own frames */
+    ap_send_tkip(ap_mac, peer_mac, -1, 213, 1, tsc + 4, gtk1, 0, body, sizeof(body));
+    EXPECT(sta_rx.count == n + 7);
+
+    /* a second Michael failure within the minute: reported, then the
+     * countermeasures: the station leaves and keeps off TKIP networks */
+    base = ap.eapol_count;
+    ap_send_tkip(ap_mac, peer_mac, -1, 214, 2, 0x12, gtk2, 2, body, sizeof(body));
+    EXPECT(ap_wait_eapol(base + 1) && ap_check_sta_key() == (0x0f00 | 2));
+    EXPECT(wait_link(RTW89_GLUE_LINK_DOWN));
+    rtw89_glue_link(&link);
+    EXPECT(link.last_error == -2000 - 14);
+    EXPECT(link.rx_tkip >= 7 && link.rx_tkip_icv >= 1 && link.rx_tkip_mic >= 2);
+    EXPECT(rtw89_glue_join((const uint8_t *)ap_ssid, strlen(ap_ssid), AP_PASSWORD,
+                           strlen(AP_PASSWORD)) == -16);
+    printf("== TKIP group: rx %u, ICV failures %u, Michael failures %u\n",
+           link.rx_tkip, link.rx_tkip_icv, link.rx_tkip_mic);
+
+    rtw89_glue_leave();
+    ap_gtk_len = 16;
+    ap_msg3_extra = NULL;
+    ap_msg3_extra_len = 0;
+    ap.gtk_pn = saved_gtk_pn;
+    ap_select(false);
+    ap_send_beacon();
+#undef EXPECT
+    printf("== TKIP group test: %d failure(s)\n", failures);
+    return failures;
+}
+
 /* The RSN element of a WPA2/WPA3 network: PSK and SAE, frame protection optional. */
 static uint8_t ap_ies_mixed[sizeof(ap_ies) + 4];
 
@@ -2254,6 +2446,7 @@ static int test_join(void)
 
     ap_select(false);
     failures += test_wpa3(gtk1);
+    failures += test_tkip_group();
     failures += test_keep();
 #undef EXPECT
     if (radio.enabled) {

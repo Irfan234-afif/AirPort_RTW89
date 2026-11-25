@@ -797,3 +797,286 @@ bool rtw89_crypto_equal(const uint8_t *a, const uint8_t *b, size_t len)
         diff |= a[i] ^ b[i];
     return diff == 0;
 }
+
+/* ------------------------------------------------------------------ */
+/*  TKIP and Michael (IEEE 802.11-2020 12.5.2), as Linux's              */
+/*  net/mac80211/tkip.c, wep.c and michael.c do them                    */
+/* ------------------------------------------------------------------ */
+
+static uint16_t get_le16(const uint8_t *p)
+{
+    return (uint16_t)(p[0] | p[1] << 8);
+}
+
+static void put_le16(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+}
+
+static uint32_t get_le32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+static void put_le32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+
+static uint16_t ror16(uint16_t v, unsigned int n)
+{
+    return (uint16_t)((v >> n) | (v << (16 - n)));
+}
+
+/* Linux's tkip_sbox[x]: 2*S(x) in the high byte, 3*S(x) in the low one, S the
+ * AES S-box, built from it here like the S-box itself. */
+static uint16_t tkip_sbox(uint8_t x)
+{
+    uint8_t s = aes_sbox[x], s2 = xtime(s);
+
+    return (uint16_t)(s2 << 8 | (uint8_t)(s2 ^ s));
+}
+
+/* tkipS(): the high byte looks the word up with its bytes swapped. */
+static uint16_t tkip_s(uint16_t v)
+{
+    uint16_t hi = tkip_sbox((uint8_t)(v >> 8));
+
+    return (uint16_t)(tkip_sbox((uint8_t)v) ^ (uint16_t)(hi << 8 | hi >> 8));
+}
+
+/* tkip_mixing_phase1(): P1K of the temporal key, the transmitter address and
+ * the TSC's high 32 bits. */
+void rtw89_tkip_phase1(const uint8_t tk[16], const uint8_t ta[6], uint32_t iv32, uint16_t p1k[5])
+{
+    unsigned int i, j;
+
+    aes_init_tables();
+    p1k[0] = (uint16_t)iv32;
+    p1k[1] = (uint16_t)(iv32 >> 16);
+    p1k[2] = get_le16(ta);
+    p1k[3] = get_le16(ta + 2);
+    p1k[4] = get_le16(ta + 4);
+    for (i = 0; i < 8; i++) {           /* PHASE1_LOOP_COUNT */
+        j = 2 * (i & 1);
+        p1k[0] = (uint16_t)(p1k[0] + tkip_s((uint16_t)(p1k[4] ^ get_le16(tk + 0 + j))));
+        p1k[1] = (uint16_t)(p1k[1] + tkip_s((uint16_t)(p1k[0] ^ get_le16(tk + 4 + j))));
+        p1k[2] = (uint16_t)(p1k[2] + tkip_s((uint16_t)(p1k[1] ^ get_le16(tk + 8 + j))));
+        p1k[3] = (uint16_t)(p1k[3] + tkip_s((uint16_t)(p1k[2] ^ get_le16(tk + 12 + j))));
+        p1k[4] = (uint16_t)(p1k[4] + tkip_s((uint16_t)(p1k[3] ^ get_le16(tk + 0 + j))) + i);
+    }
+}
+
+/* tkip_mixing_phase2(): the RC4 key of one frame, its first three bytes the
+ * WEP IV that write_tkip_iv() puts in the frame. */
+void rtw89_tkip_phase2(const uint8_t tk[16], const uint16_t p1k[5], uint16_t iv16,
+                       uint8_t rc4key[16])
+{
+    uint16_t ppk[6];
+    int i;
+
+    aes_init_tables();
+    for (i = 0; i < 5; i++)
+        ppk[i] = p1k[i];
+    ppk[5] = (uint16_t)(p1k[4] + iv16);
+
+    ppk[0] = (uint16_t)(ppk[0] + tkip_s((uint16_t)(ppk[5] ^ get_le16(tk + 0))));
+    ppk[1] = (uint16_t)(ppk[1] + tkip_s((uint16_t)(ppk[0] ^ get_le16(tk + 2))));
+    ppk[2] = (uint16_t)(ppk[2] + tkip_s((uint16_t)(ppk[1] ^ get_le16(tk + 4))));
+    ppk[3] = (uint16_t)(ppk[3] + tkip_s((uint16_t)(ppk[2] ^ get_le16(tk + 6))));
+    ppk[4] = (uint16_t)(ppk[4] + tkip_s((uint16_t)(ppk[3] ^ get_le16(tk + 8))));
+    ppk[5] = (uint16_t)(ppk[5] + tkip_s((uint16_t)(ppk[4] ^ get_le16(tk + 10))));
+    ppk[0] = (uint16_t)(ppk[0] + ror16((uint16_t)(ppk[5] ^ get_le16(tk + 12)), 1));
+    ppk[1] = (uint16_t)(ppk[1] + ror16((uint16_t)(ppk[0] ^ get_le16(tk + 14)), 1));
+    ppk[2] = (uint16_t)(ppk[2] + ror16(ppk[1], 1));
+    ppk[3] = (uint16_t)(ppk[3] + ror16(ppk[2], 1));
+    ppk[4] = (uint16_t)(ppk[4] + ror16(ppk[3], 1));
+    ppk[5] = (uint16_t)(ppk[5] + ror16(ppk[4], 1));
+
+    rc4key[0] = (uint8_t)(iv16 >> 8);
+    rc4key[1] = (uint8_t)(((iv16 >> 8) | 0x20) & 0x7f);    /* keeps weak RC4 keys out */
+    rc4key[2] = (uint8_t)iv16;
+    rc4key[3] = (uint8_t)((ppk[5] ^ get_le16(tk)) >> 1);
+    for (i = 0; i < 6; i++)
+        put_le16(rc4key + 4 + 2 * i, ppk[i]);
+    memset(ppk, 0, sizeof(ppk));
+}
+
+void rtw89_rc4(const uint8_t *key, size_t key_len, uint8_t *data, size_t len)
+{
+    uint8_t s[256], t;
+    unsigned int i, j;
+    size_t n;
+
+    for (i = 0; i < 256; i++)
+        s[i] = (uint8_t)i;
+    for (i = 0, j = 0; i < 256; i++) {
+        j = (j + s[i] + key[i % key_len]) & 0xff;
+        t = s[i];
+        s[i] = s[j];
+        s[j] = t;
+    }
+    for (n = 0, i = 0, j = 0; n < len; n++) {
+        i = (i + 1) & 0xff;
+        j = (j + s[i]) & 0xff;
+        t = s[i];
+        s[i] = s[j];
+        s[j] = t;
+        data[n] ^= s[(s[i] + s[j]) & 0xff];
+    }
+    memset(s, 0, sizeof(s));
+}
+
+/* ~crc32_le(~0, ...), bit by bit: only the group frames of a TKIP network
+ * come through here, and they are few. */
+uint32_t rtw89_crc32(const uint8_t *data, size_t len)
+{
+    uint32_t crc = 0xffffffff;
+    int k;
+
+    while (len--) {
+        crc ^= *data++;
+        for (k = 0; k < 8; k++)
+            crc = (crc >> 1) ^ (0xedb88320 & (0u - (crc & 1)));
+    }
+    return ~crc;
+}
+
+/* TSC1, the WEP seed, TSC0 and the key id, then TSC2 to TSC5. */
+uint64_t rtw89_tkip_tsc(const uint8_t iv[RTW89_TKIP_IV_LEN])
+{
+    return (uint64_t)iv[2] | (uint64_t)iv[0] << 8 | (uint64_t)get_le32(iv + 4) << 16;
+}
+
+/* ieee80211_tkip_decrypt_data() past its key id and replay checks, and
+ * ieee80211_wep_decrypt_data(). */
+bool rtw89_tkip_decrypt(const uint8_t tk[16], const uint8_t ta[6], uint8_t *body, size_t len)
+{
+    uint8_t rc4key[16], icv[RTW89_TKIP_ICV_LEN];
+    uint16_t p1k[5];
+    size_t plain_len;
+
+    if (len < RTW89_TKIP_IV_LEN + RTW89_TKIP_ICV_LEN || !(body[3] & 0x20))
+        return false;
+    plain_len = len - RTW89_TKIP_IV_LEN - RTW89_TKIP_ICV_LEN;
+    rtw89_tkip_phase1(tk, ta, get_le32(body + 4), p1k);
+    rtw89_tkip_phase2(tk, p1k, (uint16_t)(body[0] << 8 | body[2]), rc4key);
+    rtw89_rc4(rc4key, sizeof(rc4key), body + RTW89_TKIP_IV_LEN, plain_len + RTW89_TKIP_ICV_LEN);
+    memset(p1k, 0, sizeof(p1k));
+    memset(rc4key, 0, sizeof(rc4key));
+    put_le32(icv, rtw89_crc32(body + RTW89_TKIP_IV_LEN, plain_len));
+    return rtw89_crypto_equal(icv, body + RTW89_TKIP_IV_LEN + plain_len, RTW89_TKIP_ICV_LEN);
+}
+
+/* ieee80211_tkip_add_iv() and ieee80211_tkip_encrypt_data(). */
+void rtw89_tkip_encrypt(const uint8_t tk[16], const uint8_t ta[6], uint64_t tsc, uint8_t keyid,
+                        uint8_t *body, size_t len)
+{
+    uint32_t iv32 = (uint32_t)(tsc >> 16);
+    uint16_t iv16 = (uint16_t)tsc, p1k[5];
+    uint8_t rc4key[16];
+    size_t plain_len;
+
+    if (len < RTW89_TKIP_IV_LEN + RTW89_TKIP_ICV_LEN)
+        return;
+    plain_len = len - RTW89_TKIP_IV_LEN - RTW89_TKIP_ICV_LEN;
+    rtw89_tkip_phase1(tk, ta, iv32, p1k);
+    rtw89_tkip_phase2(tk, p1k, iv16, rc4key);
+    memcpy(body, rc4key, 3);
+    body[3] = (uint8_t)(keyid << 6 | 0x20);
+    put_le32(body + 4, iv32);
+    put_le32(body + RTW89_TKIP_IV_LEN + plain_len,
+             rtw89_crc32(body + RTW89_TKIP_IV_LEN, plain_len));
+    rtw89_rc4(rc4key, sizeof(rc4key), body + RTW89_TKIP_IV_LEN, plain_len + RTW89_TKIP_ICV_LEN);
+    memset(p1k, 0, sizeof(p1k));
+    memset(rc4key, 0, sizeof(rc4key));
+}
+
+/* michael_block() */
+static void michael_block(uint32_t *l, uint32_t *r, uint32_t word)
+{
+    *l ^= word;
+    *r ^= rol32(*l, 17);
+    *l += *r;
+    *r ^= ((*l & 0xff00ff00) >> 8) | ((*l & 0x00ff00ff) << 8);
+    *l += *r;
+    *r ^= rol32(*l, 3);
+    *l += *r;
+    *r ^= rol32(*l, 30);            /* ror32(l, 2) */
+    *l += *r;
+}
+
+struct michael_ctx {
+    uint32_t l, r, word;
+    unsigned int fill;              /* bytes in @word, little-endian */
+};
+
+static void michael_init(struct michael_ctx *c, const uint8_t key[8])
+{
+    c->l = get_le32(key);
+    c->r = get_le32(key + 4);
+    c->word = 0;
+    c->fill = 0;
+}
+
+static void michael_update(struct michael_ctx *c, const uint8_t *p, size_t len)
+{
+    while (len--) {
+        c->word |= (uint32_t)*p++ << (8 * c->fill);
+        if (++c->fill == 4) {
+            michael_block(&c->l, &c->r, c->word);
+            c->word = 0;
+            c->fill = 0;
+        }
+    }
+}
+
+/* The message ends with 0x5a and four to seven zeros: what is left of the
+ * last word, and one word more. */
+static void michael_final(struct michael_ctx *c, uint8_t mic[RTW89_MICHAEL_LEN])
+{
+    static const uint8_t end = 0x5a;
+
+    michael_update(c, &end, 1);
+    if (c->fill)
+        michael_block(&c->l, &c->r, c->word);
+    michael_block(&c->l, &c->r, 0);
+    put_le32(mic, c->l);
+    put_le32(mic + 4, c->r);
+    memset(c, 0, sizeof(*c));
+}
+
+void rtw89_michael_raw(const uint8_t key[8], const uint8_t *msg, size_t len,
+                       uint8_t mic[RTW89_MICHAEL_LEN])
+{
+    struct michael_ctx c;
+
+    michael_init(&c, key);
+    michael_update(&c, msg, len);
+    michael_final(&c, mic);
+}
+
+/* michael_mic(): first the pseudo header DA, SA, priority and three zeros,
+ * which is never sent. */
+void rtw89_michael(const uint8_t key[8], const uint8_t da[6], const uint8_t sa[6],
+                   uint8_t priority, const uint8_t *data, size_t len,
+                   uint8_t mic[RTW89_MICHAEL_LEN])
+{
+    struct michael_ctx c;
+    uint8_t hdr[16];
+
+    memcpy(hdr, da, 6);
+    memcpy(hdr + 6, sa, 6);
+    hdr[12] = priority;
+    hdr[13] = 0;
+    hdr[14] = 0;
+    hdr[15] = 0;
+    michael_init(&c, key);
+    michael_update(&c, hdr, sizeof(hdr));
+    michael_update(&c, data, len);
+    michael_final(&c, mic);
+}

@@ -303,6 +303,10 @@ void rtw89_mlme_rx(struct sk_buff *skb);
 void rtw89_mlme_rx_eapol(const u8 *eapol, size_t len);
 /* The driver reports that the AP is gone. Any context. */
 void rtw89_mlme_connection_lost(void);
+/* The data path found a frame whose Michael failed (TKIP): to be reported to
+ * the AP, and a second within a minute starts the countermeasures. Any
+ * context. */
+void rtw89_mlme_michael_failure(bool pairwise);
 /* The driver wants to start or stop sending aggregates to @sta on @tid. Any
  * context; 0 if the request was taken, else what
  * ieee80211_start_tx_ba_session() would return. */
@@ -323,6 +327,9 @@ struct rtw89_data_stats {
     u32 rx_unprotected;         /* in the clear on an encrypted network */
     u32 rx_fragments;           /* fragmented frames, not supported */
     u32 rx_reorder_timeout;     /* frames released because one before them never came */
+    u32 rx_tkip;                /* TKIP group frames decrypted in software */
+    u32 rx_tkip_icv;            /* ... whose ICV failed (another key, or damaged) */
+    u32 rx_tkip_mic;            /* ... whose Michael failed: reported to the AP */
 };
 
 /* @deliver gets each received Ethernet frame; called from the receive thread.
@@ -341,6 +348,9 @@ void rtw89_data_authorize(void);
 void rtw89_data_set_external(bool external);
 void rtw89_data_set_tx_key(struct ieee80211_key_conf *key);
 void rtw89_data_set_rx_key(int keyidx, bool valid, u64 rsc);
+/* A TKIP group key (the 32 bytes of the GTK KDE), decrypted with in software;
+ * rtw89_data_set_rx_key(@keyidx, false, 0) removes it. */
+void rtw89_data_set_rx_tkip_key(int keyidx, const u8 *gtk, u64 rsc);
 /* BlockAck sessions. Receive: reorder what arrives on @tid. Transmit: hold the
  * TID's frames while the session is negotiated, see rtw89_data.c. */
 int rtw89_data_rx_ba_start(u8 tid, u16 ssn, u16 buf_size);

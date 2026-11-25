@@ -683,6 +683,9 @@ void AirPort_RTW89::publishLink()
     setProperty("RTW89 RX Replayed", link.rx_replay, 32);
     setProperty("RTW89 RX Duplicates", link.rx_dup, 32);
     setProperty("RTW89 RX Reorder Timeouts", link.rx_reorder_timeout, 32);
+    setProperty("RTW89 RX TKIP Group", link.rx_tkip, 32);
+    setProperty("RTW89 RX TKIP ICV Failures", link.rx_tkip_icv, 32);
+    setProperty("RTW89 RX TKIP Michael Failures", link.rx_tkip_mic, 32);
     setProperty("RTW89 RX Late", link.rx_late, 32);
     setProperty("RTW89 RX Late With Interrupt", link.rx_late_irq, 32);
     setProperty("RTW89 RX Late Max", link.rx_late_max_ms, 32);

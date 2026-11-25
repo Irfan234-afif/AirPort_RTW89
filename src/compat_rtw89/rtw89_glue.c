@@ -4768,6 +4768,9 @@ void rtw89_glue_link(struct rtw89_glue_link *link)
     link->rx_replay = stats.rx_replay;
     link->rx_dup = stats.rx_dup;
     link->rx_reorder_timeout = stats.rx_reorder_timeout;
+    link->rx_tkip = stats.rx_tkip;
+    link->rx_tkip_icv = stats.rx_tkip_icv;
+    link->rx_tkip_mic = stats.rx_tkip_mic;
     link->rx_late = glue.rx_late;
     link->rx_late_irq = glue.rx_late_irq;
     link->rx_late_max_ms = glue.rx_late_max;

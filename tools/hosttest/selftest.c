@@ -308,6 +308,93 @@ static void test_crypto(void)
         rtw89_ccmp_encrypt(tk, hdr, sizeof(hdr), 0xb5039776e70cULL, buf, sizeof(buf), mic);
         CHECK(!rtw89_ccmp_decrypt(tk, hdr, sizeof(hdr), 0xb5039776e70dULL, buf, sizeof(buf), mic));
     }
+
+    /* TKIP's pieces, for the group key of a WPA/WPA2 mixed network */
+    {
+        u8 buf[32];
+
+        /* the CRC-32 check value; RC4's well-known vectors */
+        CHECK(rtw89_crc32((const u8 *)"123456789", 9) == 0xcbf43926u);
+        memcpy(buf, "Plaintext", 9);
+        rtw89_rc4((const u8 *)"Key", 3, buf, 9);
+        CHECK(hex_is(buf, "bbf316e8d940af0ad3", 9));
+        memcpy(buf, "Attack at dawn", 14);
+        rtw89_rc4((const u8 *)"Secret", 6, buf, 14);
+        CHECK(hex_is(buf, "45a01f645fc35b383552544b9bf5", 14));
+    }
+    {
+        /* Michael: the IEEE 802.11 test vectors, each key the MIC before it */
+        static const char *const msgs[6] = { "", "M", "Mi", "Mic", "Mich", "Michael" };
+        static const size_t lens[6] = { 0, 1, 2, 3, 4, 7 };
+        static const char *const mics[6] = {
+            "82925c1ca1d130b8", "434721ca40639b3f", "e8f9becae97e5d29",
+            "90038fc6cf13c1db", "d55e100510128986", "0a942b124ecaa546",
+        };
+        u8 k8[8], mic[8];
+
+        memset(k8, 0, sizeof(k8));
+        for (i = 0; i < 6; i++) {
+            rtw89_michael_raw(k8, (const u8 *)msgs[i], lens[i], mic);
+            CHECK(hex_is(mic, mics[i], 8));
+            memcpy(k8, mic, 8);
+        }
+    }
+    {
+        /* TKIP key mixing: the IEEE 802.11i reference code's vectors */
+        static const u8 ta1[6] = { 0x10, 0x22, 0x33, 0x44, 0x55, 0x66 };
+        static const u8 tk2[16] = { 0x63, 0x89, 0x3b, 0x25, 0x08, 0x40, 0xb8, 0xae,
+                                    0x0b, 0xd0, 0xfa, 0x7e, 0x61, 0xd2, 0x78, 0x3e };
+        static const u8 ta2[6] = { 0x64, 0xf2, 0xea, 0xed, 0xdc, 0x25 };
+        static const u16 p1k1[5] = { 0x3dd2, 0x016e, 0x76f4, 0x8697, 0xb2e8 };
+        static const u16 p1k3[5] = { 0x7c67, 0x49d7, 0x9724, 0xb5e9, 0xb4f1 };
+        static const u16 p1k4[5] = { 0x5a5d, 0x73a8, 0xa859, 0x2ec1, 0xdc8b };
+        u8 tk1[16], rc4key[16];
+        u16 p1k[5];
+
+        for (i = 0; i < 16; i++)
+            tk1[i] = (u8)i;
+        rtw89_tkip_phase1(tk1, ta1, 0, p1k);
+        CHECK(!memcmp(p1k, p1k1, sizeof(p1k)));
+        rtw89_tkip_phase2(tk1, p1k1, 0, rc4key);
+        CHECK(hex_is(rc4key, "00200033ea8d2f60ca6d1374234a660b", 16));
+        rtw89_tkip_phase2(tk1, p1k1, 1, rc4key);
+        CHECK(hex_is(rc4key, "00200190ffdc314389a9d9d074fd20aa", 16));
+        rtw89_tkip_phase1(tk2, ta2, 0x20dcfd43, p1k);
+        CHECK(!memcmp(p1k, p1k3, sizeof(p1k)));
+        rtw89_tkip_phase2(tk2, p1k3, 0xffff, rc4key);
+        CHECK(hex_is(rc4key, "ff7fff93810fc6e58f5dd326251544ce", 16));
+        rtw89_tkip_phase1(tk2, ta2, 0x20dcfd44, p1k);
+        CHECK(!memcmp(p1k, p1k4, sizeof(p1k)));
+        rtw89_tkip_phase2(tk2, p1k4, 0, rc4key);
+        CHECK(hex_is(rc4key, "002000498ca471fcfbfaa16e3610f005", 16));
+    }
+    {
+        /* TKIP sealed and opened again, the IV kept; a flipped bit, another
+         * key or another transmitter fails the ICV */
+        static const u8 tk[16] = { 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a,
+                                   0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a };
+        static const u8 ta[6] = { 2, 0xd2, 0x0b, 0x10, 0x20, 0x30 };
+        static const u8 plain[20] = { 0xaa, 0xaa, 0x03, 0, 0, 0, 0x08, 0x00,
+                                      'd', 'a', 't', 'a', 'g', 'r', 'a', 'm', 1, 2, 3, 4 };
+        u8 sealed[8 + 20 + 4], body[sizeof(sealed)];
+
+        memcpy(sealed + 8, plain, sizeof(plain));
+        rtw89_tkip_encrypt(tk, ta, 0x00012345ffffULL, 1, sealed, sizeof(sealed));
+        CHECK(hex_is(sealed, "ff7fff6045230100", 8));
+        CHECK(rtw89_tkip_tsc(sealed) == 0x00012345ffffULL);
+        memcpy(body, sealed, sizeof(body));
+        CHECK(rtw89_tkip_decrypt(tk, ta, body, sizeof(body)));
+        CHECK(!memcmp(body, sealed, 8) && !memcmp(body + 8, plain, sizeof(plain)));
+        memcpy(body, sealed, sizeof(body));
+        body[12] ^= 1;
+        CHECK(!rtw89_tkip_decrypt(tk, ta, body, sizeof(body)));
+        memcpy(body, sealed, sizeof(body));
+        CHECK(!rtw89_tkip_decrypt(tk, aa, body, sizeof(body)));
+        memcpy(body, sealed, sizeof(body));
+        body[3] &= (u8)~0x20;
+        CHECK(!rtw89_tkip_decrypt(tk, ta, body, sizeof(body)));
+        CHECK(!rtw89_tkip_decrypt(tk, ta, body, 11));
+    }
 }
 
 /* ---- cfg80211 helpers ---- */

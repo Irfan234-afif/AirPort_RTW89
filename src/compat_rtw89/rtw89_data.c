@@ -20,7 +20,11 @@
  * TCP can be slowed down properly, instead of losing frames here.
  *
  * Not here yet: fragments (dropped) and software decryption (a protected
- * frame the hardware did not decrypt is dropped and counted).
+ * frame the hardware did not decrypt is dropped and counted), except for the
+ * group frames of a WPA/WPA2 mixed network: its TKIP group key is one rtw89
+ * keeps out of chips without hw_tkip_crypto, the RTL8852B among them, and
+ * data_rx_tkip() decrypts what the AP sends under it, as mac80211 does for a
+ * key set_key refused.
  *
  * Locking: tx_lock orders sequence numbers, packet numbers and the queueing of
  * a frame. rx_lock serialises the whole receive path, delivery to the network
@@ -31,6 +35,7 @@
  * tx_lock.
  */
 #include "rtw89_net80211.h"
+#include "rtw89_crypto.h"
 
 #define DATA_MAX_FRAME      (ETH_HLEN + IEEE80211_MAX_DATA_LEN)
 /* 802.11 QoS header, CCMP header and LLC/SNAP in front of the payload */
@@ -50,9 +55,14 @@
 #define DATA_REORDER_MAX    IEEE80211_MAX_AMPDU_BUF_HT
 #define DATA_REORDER_TIMEOUT (HZ / 10)  /* HT_RX_REORDER_BUF_TIMEOUT */
 
-/* Receive state of one key: the last packet number seen per TID. */
+/* Receive state of one key: the last packet number seen per TID. A TKIP
+ * group key is kept here as well, for data_rx_tkip(). */
 struct data_rx_key {
     bool valid;
+    bool tkip;
+    u32 tkip_seen;              /* TIDs with a frame under it: a TSC of 0 is then a replay */
+    u8 tk[16];                  /* TKIP: the temporal key */
+    u8 mic_key[8];              /* ... and the Michael key the AP signs its frames with */
     u64 pn[DATA_NUM_TIDS];
 };
 
@@ -298,8 +308,36 @@ void rtw89_data_set_rx_key(int keyidx, bool valid, u64 rsc)
 
     spin_lock(&data.rx_lock);
     key->valid = valid;
+    key->tkip = false;
+    key->tkip_seen = 0;
+    memset(key->tk, 0, sizeof(key->tk));
+    memset(key->mic_key, 0, sizeof(key->mic_key));
     for (i = 0; i < DATA_NUM_TIDS; i++)
         key->pn[i] = rsc;
+    spin_unlock(&data.rx_lock);
+}
+
+/* A TKIP group key, which stays out of the chip: @gtk is the 32 bytes of the
+ * GTK KDE, the temporal key, then the Michael key the authenticator sends
+ * with (the station's receive key: wpa_supplicant swaps it to
+ * NL80211_TKIP_DATA_OFFSET_RX_MIC_KEY), then the one it would receive with. */
+void rtw89_data_set_rx_tkip_key(int keyidx, const u8 *gtk, u64 rsc)
+{
+    struct data_rx_key *key;
+    int i;
+
+    if (keyidx < 0 || keyidx > 3)
+        return;
+    key = &data.rx_gtk[keyidx];
+
+    spin_lock(&data.rx_lock);
+    memcpy(key->tk, gtk, sizeof(key->tk));
+    memcpy(key->mic_key, gtk + 16, sizeof(key->mic_key));
+    key->tkip = true;
+    key->tkip_seen = 0;
+    for (i = 0; i < DATA_NUM_TIDS; i++)
+        key->pn[i] = rsc;
+    key->valid = true;
     spin_unlock(&data.rx_lock);
 }
 
@@ -659,6 +697,61 @@ static void data_rx_amsdu(u8 *p, size_t len, bool decrypted)
     }
 }
 
+/*
+ * A group frame under a TKIP key, which the chip hands up as it came (no key
+ * of its own matched): mac80211's ieee80211_crypto_tkip_decrypt() and
+ * ieee80211_rx_h_michael_mic_verify() for a key its driver refused. The
+ * replay check, the decryption and its ICV, then Michael over the MSDU, and
+ * only then the new TSC (IEEE 802.11 12.5.2.6). On success *@payload and
+ * *@len are the MSDU, without IV, Michael and ICV. A Michael that fails on a
+ * frame whose ICV held is reported to the MLME, which tells the AP. @tid is
+ * the frame's, DATA_NOQOS without QoS. rx_lock is held.
+ */
+static bool data_rx_tkip(const struct ieee80211_hdr *hdr, unsigned int tid, u8 **payload,
+                         size_t *len)
+{
+    struct data_rx_key *key = &data.rx_gtk[(*payload)[3] >> 6];
+    u8 *body = *payload, mic[RTW89_MICHAEL_LEN];
+    size_t msdu_len;
+    u64 tsc;
+
+    /* from the AP alone, as mac80211 wants the sender's station entry */
+    if (!ieee80211_has_fromds(hdr->frame_control) || ieee80211_has_tods(hdr->frame_control) ||
+        !ether_addr_equal(hdr->addr2, data.bssid))
+        return false;
+    if (*len < RTW89_TKIP_IV_LEN + RTW89_MICHAEL_LEN + RTW89_TKIP_ICV_LEN)
+        return false;
+
+    /* ieee80211_tkip_decrypt_data(): the TSC must go up, but the first frame
+     * under a key whose counter starts at 0 may itself be 0 */
+    tsc = rtw89_tkip_tsc(body);
+    if (tsc < key->pn[tid] || (tsc == key->pn[tid] && (tsc || (key->tkip_seen & BIT(tid))))) {
+        data.stats.rx_replay++;
+        return false;
+    }
+    if (!rtw89_tkip_decrypt(key->tk, hdr->addr2, body, *len)) {
+        data.stats.rx_tkip_icv++;
+        return false;
+    }
+
+    msdu_len = *len - RTW89_TKIP_IV_LEN - RTW89_MICHAEL_LEN - RTW89_TKIP_ICV_LEN;
+    /* michael_mic_hdr(): DA and SA of a frame from the DS, and its TID */
+    rtw89_michael(key->mic_key, hdr->addr1, hdr->addr3, tid == DATA_NOQOS ? 0 : (u8)tid,
+                  body + RTW89_TKIP_IV_LEN, msdu_len, mic);
+    if (!rtw89_crypto_equal(mic, body + RTW89_TKIP_IV_LEN + msdu_len, RTW89_MICHAEL_LEN)) {
+        data.stats.rx_tkip_mic++;
+        rtw89_mlme_michael_failure(false);
+        return false;
+    }
+
+    key->pn[tid] = tsc;
+    key->tkip_seen |= (u32)BIT(tid);
+    data.stats.rx_tkip++;
+    *payload = body + RTW89_TKIP_IV_LEN;
+    *len = msdu_len;
+    return true;
+}
+
 /* What mac80211's rx handlers do after reordering: decryption checks, then
  * the payload. rx_lock is held; the caller frees the skb. */
 static void data_rx_one(struct sk_buff *skb)
@@ -692,6 +785,15 @@ static void data_rx_one(struct sk_buff *skb)
 
         /* Decrypted by the hardware, which leaves the CCMP header and MIC. */
         if (!(status->flag & RX_FLAG_DECRYPTED)) {
+            /* ... unless the AP's group key is TKIP, which the chip does not
+             * have; TKIP does not carry A-MSDUs */
+            if (mcast && !amsdu && len >= RTW89_TKIP_IV_LEN && (payload[3] & 0x20) &&
+                data.rx_gtk[payload[3] >> 6].valid && data.rx_gtk[payload[3] >> 6].tkip) {
+                if (!data_rx_tkip(hdr, tid, &payload, &len))
+                    goto drop;
+                decrypted = true;
+                goto msdu;
+            }
             data.stats.rx_undecrypted++;
             goto drop;
         }
@@ -723,6 +825,7 @@ static void data_rx_one(struct sk_buff *skb)
         decrypted = true;
     }
 
+msdu:
     /* the Ethernet header is written over the end of the 802.11 one */
     memcpy(da, hdr->addr1, ETH_ALEN);
     memcpy(sa, hdr->addr3, ETH_ALEN);

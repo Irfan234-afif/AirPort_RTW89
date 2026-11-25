@@ -82,6 +82,7 @@ static struct {
     u8 held_m1[160];            /* handshake message 1 that came before the PMK */
     u16 held_m1_len;
     u8 group_cipher[4];         /* group data cipher suite from the AP's RSN IE */
+    bool group_tkip;            /* ... TKIP, pairwise CCMP: a WPA/WPA2 mixed network */
 
     /* what the AP's RSN element offers, and what this join takes of it */
     u32 ap_akms;                /* BIT(n) for each 00-0f-ac:n suite */
@@ -138,6 +139,20 @@ static struct {
     bool replay_valid;
     struct ieee80211_key_conf *ptk_conf;
     struct ieee80211_key_conf *gtk_conf[4];     /* by key id; the AP alternates */
+    /* TKIP group keys, which stay out of the chip: rtw89_data.c decrypts */
+    u8 gtk_tkip[4][WLAN_KEY_LEN_TKIP];
+    bool gtk_tkip_valid[4];
+    u8 eapol_version;           /* of the AP's EAPOL frames, for our own requests */
+    u64 request_counter;        /* replay counter of our EAPOL-Key requests */
+
+    /* TKIP countermeasures (12.5.2.5): Michael failures the data path found */
+    u32 michael_pending;
+    bool michael_pairwise;
+    unsigned long michael_last;         /* jiffies of the last one; 0: none */
+    bool tkip_blocked;                  /* no TKIP network until tkip_block_until */
+    unsigned long tkip_block_until;
+    struct wiphy_work michael_work;
+    struct wiphy_delayed_work countermeasure_work;
 
     /* BlockAck sessions */
     struct mlme_tx_ba {
@@ -397,13 +412,15 @@ static void mlme_parse_rates(const u8 *ies, size_t len, u32 *rates, u32 *basic)
 /* What the AP's RSN element allows us to use. Returns 0 if CCMP with WPA2-PSK
  * (or, with @external, 802.1X) works. */
 /*
- * What the AP's RSN element offers: the ciphers (CCMP for both pairwise and
- * group traffic, the only ones taken), the key management suites and the
- * capabilities. Fills mlme.group_cipher, ap_akms and ap_rsn_caps.
+ * What the AP's RSN element offers: the ciphers (CCMP pairwise; CCMP for the
+ * group traffic, or TKIP on a WPA/WPA2 mixed network, whose group frames
+ * rtw89_data.c decrypts in software), the key management suites and the
+ * capabilities. Fills mlme.group_cipher, group_tkip, ap_akms and ap_rsn_caps.
  */
 static int mlme_parse_rsn(const struct element *rsn)
 {
     static const u8 suite_ccmp[4] = { 0x00, 0x0f, 0xac, 4 };
+    static const u8 suite_tkip[4] = { 0x00, 0x0f, 0xac, 2 };
     static const u8 suite_bip[4] = { 0x00, 0x0f, 0xac, 6 };
     const u8 *p = rsn->data, *end = rsn->data + rsn->datalen;
     bool ccmp = false;
@@ -411,6 +428,7 @@ static int mlme_parse_rsn(const struct element *rsn)
 
     mlme.ap_akms = 0;
     mlme.ap_rsn_caps = 0;
+    mlme.group_tkip = false;
     if (end - p < 8 || get_unaligned_le16(p) != 1)
         return -EINVAL;
     p += 2;
@@ -460,6 +478,22 @@ static int mlme_parse_rsn(const struct element *rsn)
         mlme_info("the network does not offer CCMP as pairwise cipher");
         return -EOPNOTSUPP;
     }
+    if (!memcmp(mlme.group_cipher, suite_tkip, 4)) {
+        /* WPA/WPA2 mixed: CCMP for us, so HT and later stay on, and TKIP for
+         * the AP's group frames, which most of these chips cannot decrypt
+         * (rtw89's hw_tkip_crypto): mac80211 does it in software, and so
+         * does rtw89_data.c. */
+        if (mlme.tkip_blocked && time_before(jiffies, mlme.tkip_block_until)) {
+            mlme_info("TKIP countermeasures: no TKIP network for another %lu s",
+                      (mlme.tkip_block_until - jiffies) / HZ + 1);
+            return -EBUSY;
+        }
+        mlme.tkip_blocked = false;
+        mlme.group_tkip = true;
+        mlme_info("the network's group cipher is TKIP (WPA/WPA2 mixed): "
+                  "CCMP for this station, the AP's group frames decrypted in software");
+        return 0;
+    }
     if (memcmp(mlme.group_cipher, suite_ccmp, 4)) {
         mlme_info("the network's group cipher is not CCMP (%02x-%02x-%02x:%u)",
                   mlme.group_cipher[0], mlme.group_cipher[1], mlme.group_cipher[2],
@@ -483,6 +517,17 @@ static int mlme_choose_akm(bool sae, bool psk)
     const u16 caps = mlme.ap_rsn_caps;
     u8 *ie = mlme.own_rsn_ie;
     u16 own_caps = 0;
+
+    if (mlme.group_tkip) {
+        /* TKIP goes with WPA2-PSK alone: not with SAE, PSK-SHA256 or
+         * management frame protection (12.6.3.4) */
+        if (!psk || !(akms & BIT(AKM_PSK)) || (caps & RSN_CAP_MFPR)) {
+            mlme_info("the network's TKIP group cipher goes only with WPA2-PSK, "
+                      "which it does not offer here");
+            return -EOPNOTSUPP;
+        }
+        sae = false;
+    }
 
     if (sae && (akms & BIT(AKM_SAE)))
         mlme.akm = AKM_SAE;
@@ -512,7 +557,8 @@ static int mlme_choose_akm(bool sae, bool psk)
     ie[1] = 20;
     ie[2] = 1;                                          /* version */
     ie[3] = 0;
-    memcpy(ie + 4, "\x00\x0f\xac\x04", 4);              /* group cipher: CCMP */
+    /* group cipher: the AP's, CCMP or TKIP */
+    memcpy(ie + 4, mlme.group_tkip ? "\x00\x0f\xac\x02" : "\x00\x0f\xac\x04", 4);
     memcpy(ie + 8, "\x01\x00\x00\x0f\xac\x04", 6);      /* pairwise: CCMP */
     memcpy(ie + 14, "\x01\x00\x00\x0f\xac", 5);          /* one AKM */
     ie[19] = mlme.akm;
@@ -528,6 +574,11 @@ static int mlme_check_rsn_8021x(const struct element *rsn)
 
     if (ret)
         return ret;
+    if (mlme.group_tkip) {
+        /* the system's supplicant hands over CCMP keys alone */
+        mlme_info("802.1X sign-in to a network with a TKIP group cipher is not supported");
+        return -EOPNOTSUPP;
+    }
     if (!(mlme.ap_akms & BIT(AKM_8021X))) {
         mlme_info("the network does not offer 802.1X sign-in");
         return -EOPNOTSUPP;
@@ -819,13 +870,32 @@ static void mlme_key_remove(struct ieee80211_key_conf **slot, struct ieee80211_s
     rtw89_m80211_free_later(mlme.hw, conf, NULL);
 }
 
+/* Whether the group key with id @idx is this one already: installed again, it
+ * would start its replay counter over (KRACK). */
+static bool mlme_gtk_is(int idx, const u8 *gtk)
+{
+    if (mlme.group_tkip)
+        return mlme.gtk_tkip_valid[idx] &&
+               rtw89_crypto_equal(mlme.gtk_tkip[idx], gtk, WLAN_KEY_LEN_TKIP);
+    return mlme_key_is(mlme.gtk_conf[idx], gtk, (s8)idx);
+}
+
 /* Install the group key with id @idx unless it is the one already there. */
 static int mlme_gtk_install(int idx, const u8 *gtk, u64 rsc)
 {
     int ret;
 
-    if (mlme_key_is(mlme.gtk_conf[idx], gtk, (s8)idx))
+    if (mlme_gtk_is(idx, gtk))
         return 0;
+    if (mlme.group_tkip) {
+        /* Not for the chip: rtw89_cam_sec_key_add() refuses TKIP where
+         * hw_tkip_crypto is false, before it sends anything, and mac80211
+         * keeps the key in software. rtw89_data.c decrypts with it. */
+        memcpy(mlme.gtk_tkip[idx], gtk, WLAN_KEY_LEN_TKIP);
+        mlme.gtk_tkip_valid[idx] = true;
+        rtw89_data_set_rx_tkip_key(idx, gtk, rsc);
+        return 0;
+    }
     if (mlme.gtk_conf[idx]) {
         rtw89_data_set_rx_key(idx, false, 0);
         mlme_key_remove(&mlme.gtk_conf[idx], NULL);
@@ -923,6 +993,11 @@ static void mlme_teardown(u16 deauth_reason)
     mlme_key_remove(&mlme.ptk_conf, mlme.sta);
     for (i = 0; i < ARRAY_SIZE(mlme.gtk_conf); i++)
         mlme_key_remove(&mlme.gtk_conf[i], NULL);
+    /* the TKIP group keys never reached the chip; the data path forgot its
+     * copies in rtw89_data_detach() */
+    memset(mlme.gtk_tkip, 0, sizeof(mlme.gtk_tkip));
+    memset(mlme.gtk_tkip_valid, 0, sizeof(mlme.gtk_tkip_valid));
+    mlme.group_tkip = false;
     memset(&mlme.ptk, 0, sizeof(mlme.ptk));
     memset(&mlme.tptk, 0, sizeof(mlme.tptk));
     mlme.ptk_valid = false;
@@ -2744,9 +2819,12 @@ static bool mlme_verify_mic(const u8 *copy, size_t len, const u8 *their_mic)
 }
 
 /* Find the group key in decrypted key data: a KDE dd <len> 00-0f-ac 01
- * <key id | tx> <reserved> <key>. Returns the key id, or -1. */
+ * <key id | tx> <reserved> <key>, the key 16 bytes for CCMP, 32 for TKIP.
+ * Returns the key id, or -1. */
 static int mlme_find_gtk(const u8 *kd, size_t len, const u8 **gtk)
 {
+    const size_t key_len = mlme.group_tkip ? WLAN_KEY_LEN_TKIP : WLAN_KEY_LEN_CCMP;
+
     while (len >= 2) {
         u8 id = kd[0], elen = kd[1];
 
@@ -2754,7 +2832,7 @@ static int mlme_find_gtk(const u8 *kd, size_t len, const u8 **gtk)
             break;
         if ((size_t)elen + 2 > len)
             break;
-        if (id == 0xdd && elen == 6 + WLAN_KEY_LEN_CCMP &&
+        if (id == 0xdd && elen == 6 + key_len &&
             kd[2] == 0x00 && kd[3] == 0x0f && kd[4] == 0xac && kd[5] == 1) {
             *gtk = kd + 8;
             return kd[6] & 0x03;
@@ -2813,6 +2891,7 @@ static void mlme_rx_eapol(const u8 *e, size_t len)
     /* only frames an authenticator sends */
     if (!(key_info & KEY_INFO_ACK) || (key_info & (KEY_INFO_REQUEST | KEY_INFO_ERROR)))
         return;
+    mlme.eapol_version = e[0];          /* for a Michael failure report */
     /* the replay counter must move forward */
     if (mlme.replay_valid && memcmp(k + KEY_OFF_REPLAY, mlme.replay, 8) <= 0)
         return;
@@ -2924,7 +3003,7 @@ static void mlme_rx_eapol(const u8 *e, size_t len)
             goto out;
         mlme_send_eapol_key(&mlme.ptk, e[0], KEY_INFO_SECURE, k + KEY_OFF_REPLAY,
                             NULL, NULL, 0);
-        if (mlme_key_is(mlme.gtk_conf[gtk_idx], gtk, (s8)gtk_idx))
+        if (mlme_gtk_is(gtk_idx, gtk))
             goto out;
         if (mlme_gtk_install(gtk_idx, gtk, rsc))
             mlme_info("the driver refused the new group key");
@@ -3884,6 +3963,68 @@ static void mlme_lost_work(struct wiphy *wiphy, struct wiphy_work *work)
     mlme_teardown(WLAN_REASON_DISASSOC_DUE_TO_INACTIVITY);
 }
 
+void rtw89_mlme_michael_failure(bool pairwise)
+{
+    if (!mlme.running)
+        return;
+    mlme.michael_pairwise = pairwise;
+    __atomic_add_fetch(&mlme.michael_pending, 1, __ATOMIC_SEQ_CST);
+    wiphy_work_queue(mlme.hw->wiphy, &mlme.michael_work);
+}
+
+/*
+ * Michael failures (12.5.2.5), as wpa_supplicant's
+ * wpa_supplicant_event_michael_mic_failure() handles them: each is reported
+ * to the AP in an EAPOL-Key request with Error set (wpa_sm_key_request()),
+ * under a replay counter of its own. The second within a minute of the one
+ * before starts the countermeasures: the station leaves, after a moment so
+ * its report is on the air first, and joins no TKIP network for a minute.
+ * The AP, with two reports, stops TKIP for a minute as well.
+ */
+static void mlme_michael_work(struct wiphy *wiphy, struct wiphy_work *work)
+{
+    u32 pending = __atomic_exchange_n(&mlme.michael_pending, 0, __ATOMIC_SEQ_CST);
+    u16 key_info = KEY_INFO_REQUEST | KEY_INFO_ERROR | KEY_INFO_SECURE;
+    u8 replay[8];
+    bool second;
+    int i;
+
+    if (mlme.michael_pairwise)
+        key_info |= KEY_INFO_PAIRWISE;
+    while (pending--) {
+        if (!mlme.running || mlme.state != RTW89_MLME_CONNECTED || !mlme.ptk_valid ||
+            mlme.tkip_blocked)
+            return;
+        second = mlme.michael_last && time_before(jiffies, mlme.michael_last + 60 * HZ);
+        mlme.michael_last = jiffies ? jiffies : 1;
+
+        mlme.request_counter++;
+        for (i = 0; i < 8; i++)
+            replay[i] = (u8)(mlme.request_counter >> (56 - 8 * i));
+        mlme_send_eapol_key(&mlme.ptk, mlme.eapol_version ? mlme.eapol_version : 2, key_info,
+                            replay, NULL, NULL, 0);
+        if (!second) {
+            mlme_info("TKIP: Michael MIC failure on a %s frame, reported to the AP",
+                      mlme.michael_pairwise ? "unicast" : "group");
+            continue;
+        }
+        mlme_info("TKIP: a second Michael MIC failure within a minute: countermeasures, "
+                  "no TKIP network for 60 s");
+        mlme.tkip_blocked = true;
+        mlme.tkip_block_until = jiffies + 60 * HZ;
+        wiphy_delayed_work_queue(mlme.hw->wiphy, &mlme.countermeasure_work, HZ / 10);
+        return;
+    }
+}
+
+static void mlme_countermeasure_work(struct wiphy *wiphy, struct wiphy_work *work)
+{
+    if (!mlme.running || mlme.state < RTW89_MLME_ASSOCIATED || !mlme.group_tkip)
+        return;
+    mlme.last_error = -2000 - WLAN_REASON_MIC_FAILURE;
+    mlme_teardown(WLAN_REASON_MIC_FAILURE);
+}
+
 static void mlme_timeout_work(struct wiphy *wiphy, struct wiphy_work *work)
 {
     switch (mlme.state) {
@@ -3950,6 +4091,8 @@ void rtw89_mlme_start(struct ieee80211_hw *hw, struct ieee80211_vif *vif, void (
     skb_queue_head_init(&mlme.rxq);
     wiphy_work_init(&mlme.rx_work, mlme_rx_work);
     wiphy_work_init(&mlme.lost_work, mlme_lost_work);
+    wiphy_work_init(&mlme.michael_work, mlme_michael_work);
+    wiphy_delayed_work_init(&mlme.countermeasure_work, mlme_countermeasure_work);
     wiphy_work_init(&mlme.beacon_loss_work, mlme_beacon_loss_work);
     wiphy_work_init(&mlme.probe_work, mlme_probe_work);
     wiphy_delayed_work_init(&mlme.probe_timeout_work, mlme_probe_work);
@@ -3979,6 +4122,8 @@ void rtw89_mlme_stop(void)
     wiphy_delayed_work_cancel(mlme.hw->wiphy, &mlme.timeout_work);
     wiphy_work_cancel(mlme.hw->wiphy, &mlme.rx_work);
     wiphy_work_cancel(mlme.hw->wiphy, &mlme.lost_work);
+    wiphy_work_cancel(mlme.hw->wiphy, &mlme.michael_work);
+    wiphy_delayed_work_cancel(mlme.hw->wiphy, &mlme.countermeasure_work);
     wiphy_work_cancel(mlme.hw->wiphy, &mlme.beacon_loss_work);
     wiphy_work_cancel(mlme.hw->wiphy, &mlme.probe_work);
     wiphy_delayed_work_cancel(mlme.hw->wiphy, &mlme.probe_timeout_work);
@@ -4250,6 +4395,7 @@ static int mlme_connect(const struct rtw89_mlme_bss *bss, const u8 *pmk,
 
     elem = mlme_find_elem(WLAN_EID_RSN, mlme.ies, bss->ies_len);
     mlme.rsn = elem != NULL;
+    mlme.group_tkip = false;            /* mlme_parse_rsn() says otherwise */
     mlme.have_pmk = false;
     mlme.held_m1_len = 0;
     mlme.external = external && elem;
