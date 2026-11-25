@@ -403,8 +403,8 @@ scanrequesttest:
 	@$(BUILD_DIR)/out/scan_request_test
 
 hosttest: link scanrequesttest
-	@cc -c -O1 -g -Wall -o $(BUILD_DIR)/out/host_kernel.o tools/hosttest/host_kernel.c
-	@cc -c -O1 -g -Wall -DOWLY_NATIVE_PEER_DATA=$(OWLY_NATIVE_PEER_DATA) -I$(COMPAT89_DIR) -o $(BUILD_DIR)/out/host_main.o tools/hosttest/host_main.c
+	@cc $(ARCH) -c -O1 -g -Wall -o $(BUILD_DIR)/out/host_kernel.o tools/hosttest/host_kernel.c
+	@cc $(ARCH) -c -O1 -g -Wall -DOWLY_NATIVE_PEER_DATA=$(OWLY_NATIVE_PEER_DATA) -I$(COMPAT89_DIR) -o $(BUILD_DIR)/out/host_main.o tools/hosttest/host_main.c
 	@$(CC) $(DRIVER_CFLAGS) -MF /dev/null -c tools/hosttest/selftest.c -o $(BUILD_DIR)/out/selftest.o 2> $(BUILD_DIR)/log/hosttest_selftest.log \
 	    || { grep -E 'error' $(BUILD_DIR)/log/hosttest_selftest.log >&2; exit 1; }
 	@$(CC) $(DRIVER_CFLAGS) -MF /dev/null -c tools/hosttest/fakechip_core.c -o $(BUILD_DIR)/out/fakechip_core.o 2> $(BUILD_DIR)/log/hosttest_fakechip_core.log \
@@ -412,7 +412,7 @@ hosttest: link scanrequesttest
 	@cc $(ARCH) -o $(HOSTTEST) $(HOST_OBJS) $(LINKED_OBJ) -lz
 	@cc $(ARCH) -o $(HOSTTEST)_fakechip $(HOST_OBJS) $(BUILD_DIR)/out/fakechip_core.o \
 	    $(filter-out $(BUILD_DIR)/compat_rtw89/rtw89_core_wrap.o,$(ALL_OBJS)) -lz
-	@cc -c -O1 -g -w $(filter-out -DMBEDTLS%,$(SAE_INC)) tools/hosttest/sae_test.c -o $(BUILD_DIR)/out/sae_test_main.o
+	@cc $(ARCH) -c -O1 -g -w $(filter-out -DMBEDTLS%,$(SAE_INC)) tools/hosttest/sae_test.c -o $(BUILD_DIR)/out/sae_test_main.o
 	@cc $(ARCH) -o $(SAETEST)_kernel $(BUILD_DIR)/out/sae_test_main.o $(SAE_KOBJS) \
 	    $(BUILD_DIR)/fw/rtw89_crypto.o $(BUILD_DIR)/out/host_kernel.o
 	@#
