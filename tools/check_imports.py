@@ -59,6 +59,9 @@ def main():
         print(f"{len(undefined)} undefined symbols; no {KERNEL} to check them against")
         return 0
     provided = symbols(KERNEL, "-g")
+    # A boot collection to check the families against: this Mac's, or the
+    # target's copied in with --also. An Apple silicon Mac has none of its own.
+    have_kc = KEXT_COLLECTION.exists() or any(a.suffix == ".kc" for a in also)
     if KEXT_COLLECTION.exists():
         provided |= symbols(KEXT_COLLECTION, "-g")
     for a in also:
@@ -72,11 +75,20 @@ def main():
         lines = ["# Kernel imports", "",
                  f"Symbols `{obj.name}` leaves for others to resolve: "
                  f"**{len(undefined)}**, unresolved: **{len(unresolved)}**.", ""]
-        lines += [f"- `{s[1:]}`" + ("  **(nobody has this)**" if s in unresolved else "")
+        mark = "  **(nobody has this)**" if have_kc else "  **(not checked: no boot collection)**"
+        lines += [f"- `{s[1:]}`" + (mark if s in unresolved else "")
                   for s in undefined]
         Path(argv[1]).write_text("\n".join(lines) + "\n")
 
     print(f"  LINK {obj}: {len(undefined)} imports, {len(unresolved)} unresolved")
+    if unresolved and not have_kc:
+        # Without a boot collection the IOKit families' symbols cannot be
+        # told from ones nobody has: name them, but do not fail on them.
+        print(f"    no {KEXT_COLLECTION.name} here: {len(unresolved)} symbol(s) not checked;"
+              f" copy the target's into efi/kit/ to check them")
+        for s in unresolved:
+            print(f"    unchecked: {s[1:]}")
+        return 0
     for s in unresolved:
         print(f"    missing: {s[1:]}")
     return 1 if unresolved else 0

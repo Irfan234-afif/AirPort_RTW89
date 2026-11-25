@@ -353,6 +353,12 @@ OTHER_CHIP_IDS := b851 8852 a85a b85b b520 c852 8922 892b 892d 882d 895d
 # run everything; use QUICK while iterating and once without it before you
 # install.
 #
+# Seconds each fakechip run may take before it is killed. It runs the whole
+# association sequence four times, waiting beacons and timeouts out in real
+# time: about 610 s under Rosetta on Apple silicon with the TKIP group test,
+# just past the 600 s every other run gets.
+FAKECHIP_ALARM ?= 900
+#
 # Each entry is "<arguments>:<log name>", quoted because the arguments have
 # spaces in them: make pastes the text and the shell's own loop parses it.
 ifeq ($(QUICK),1)
@@ -432,7 +438,7 @@ hosttest: link scanrequesttest
 	        > $(BUILD_DIR)/log/$${a#*:}.failed & \
 	done; \
 	for a in $(HOST_FAKE_RUNS); do \
-	    perl -e 'alarm 600; exec @ARGV' $(HOSTTEST)_fakechip $${a%%:*} \
+	    perl -e 'alarm $(FAKECHIP_ALARM); exec @ARGV' $(HOSTTEST)_fakechip $${a%%:*} \
 	        > $(BUILD_DIR)/log/$${a#*:}.log 2>&1 \
 	        || echo "  hosttest FAILED ($${a%%:*}), see $(BUILD_DIR)/log/$${a#*:}.log" \
 	        > $(BUILD_DIR)/log/$${a#*:}.failed & \
@@ -496,6 +502,12 @@ $(BUILD_DIR)/kext/%.o: $(KEXT_SRC)/%.c
 # here, out of the same copy the EFI installs.
 FRONT_SRC    := $(PROJ_ROOT)/src/front
 FAMILY_BIN   := $(PROJ_ROOT)/efi/kit/IO80211FamilyLegacy.kext/Contents/MacOS/IO80211FamilyLegacy
+# The IOPCIFamily and IONetworkingFamily symbols the front needs are in the
+# boot kext collection, which the check reads from /System/Library/
+# KernelCollections -- and an Apple silicon Mac has none. There, copy the
+# target's /System/Library/KernelCollections/BootKernelExtensions.kc into
+# efi/kit/ and it is checked against that instead.
+FAMILY_KC    := $(wildcard $(PROJ_ROOT)/efi/kit/BootKernelExtensions.kc)
 # OWLY_NATIVEFRONT_VIF_OBSERVER_BEGIN: 0 preserves the existing frontend.
 RTW89_AWDL_NATIVE_FRONT_OBSERVE ?= 1
 # RC3: creation is separately opt-in; default "make front" must be fail-closed.
@@ -550,7 +562,7 @@ front:
 	@codesign --force --sign - $(FRONT_BUNDLE) 2>/dev/null || true
 	@echo "  KEXT $(FRONT_BUNDLE)"
 	@python3 tools/check_imports.py $(FRONT_BUNDLE)/Contents/MacOS/AirPortRTW89Front \
-	    $(BUILD_DIR)/log/front-imports.md --also $(FAMILY_BIN)
+	    $(BUILD_DIR)/log/front-imports.md --also $(FAMILY_BIN) $(FAMILY_KC)
 
 # The smoke test gates the bundle: nothing gets packaged that crashed there.
 # It runs again only when what it tests has changed since it last passed

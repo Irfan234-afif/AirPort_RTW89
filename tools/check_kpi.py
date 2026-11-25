@@ -13,6 +13,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+BOOT_KC = Path("/System/Library/KernelCollections/BootKernelExtensions.kc")
 
 def main():
     kext = Path(sys.argv[1])
@@ -22,6 +23,14 @@ def main():
 
     nm = subprocess.run(["nm", "-u", "-j", str(binary)], capture_output=True, text=True)
     wanted = {s.strip() for s in nm.stdout.splitlines() if s.strip()}
+
+    # kmutil looks the KPIs up in this Mac's boot collection. An Apple silicon
+    # Mac has none here (its own is arm64e, on the Preboot volume), so there is
+    # nothing to check an x86_64 kext against: say so rather than fail.
+    if not BOOT_KC.exists():
+        print(f"  KPI  {len(wanted)} imports not checked: no {BOOT_KC} on this Mac;"
+              f" run the build on the target to check them")
+        return 0
 
     km = subprocess.run(["kmutil", "libraries", "-p", str(kext)], capture_output=True, text=True)
     found = {}
